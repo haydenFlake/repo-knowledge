@@ -8,17 +8,18 @@ interface IndexArgs {
   files?: string[];
   summarize?: boolean;
   dryRun?: boolean;
+  dataDir?: string;
 }
 
 export async function indexCommand(args: IndexArgs): Promise<void> {
   const projectRoot = process.cwd();
 
-  if (!isInitialized(projectRoot)) {
+  if (!isInitialized(projectRoot, args.dataDir)) {
     logger.error("Not initialized. Run 'repo-knowledge init' first.");
     process.exit(1);
   }
 
-  const project = await Project.open(projectRoot);
+  const project = await Project.open(projectRoot, args.dataDir);
 
   try {
     const result = await runIndexingPipeline(project, {

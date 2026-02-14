@@ -57,6 +57,8 @@ export function getRelatedSymbols(
   return { root, callees, callers };
 }
 
+const MAX_GRAPH_RESULTS = 200;
+
 function collectEdges(
   sqlite: SqliteStore,
   symbolId: number,
@@ -69,6 +71,7 @@ function collectEdges(
 ): void {
   if (currentDepth > maxDepth) return;
   if (visited.has(symbolId)) return;
+  if (results.length >= MAX_GRAPH_RESULTS) return;
   visited.add(symbolId);
 
   const edges =
@@ -84,11 +87,7 @@ function collectEdges(
 
     if (visited.has(targetId)) continue;
 
-    // Look up the symbol
-    const targetSym = sqlite
-      .getSymbolsByFile(edge.target_file_id ?? 0)
-      .find((s) => s.id === targetId);
-
+    const targetSym = sqlite.getSymbolById(targetId);
     if (!targetSym) continue;
 
     const targetFile = sqlite.getFileById(targetSym.file_id);

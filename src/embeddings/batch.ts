@@ -9,14 +9,20 @@ export async function batchEmbed(
   texts: string[],
   provider: EmbeddingProvider,
   options: BatchEmbedOptions = {},
-): Promise<Float32Array[]> {
+): Promise<number[][]> {
   const batchSize = options.batchSize ?? 32;
-  const results: Float32Array[] = [];
+  const results: number[][] = [];
 
   for (let i = 0; i < texts.length; i += batchSize) {
     const batch = texts.slice(i, i + batchSize);
-    const vectors = await provider.embed(batch);
-    results.push(...vectors);
+    try {
+      const vectors = await provider.embed(batch);
+      results.push(...vectors);
+    } catch (err) {
+      throw new Error(
+        `Embedding failed on batch ${Math.floor(i / batchSize) + 1} (items ${i}-${Math.min(i + batchSize, texts.length)}): ${err instanceof Error ? err.message : err}`,
+      );
+    }
     options.onProgress?.(Math.min(i + batchSize, texts.length), texts.length);
   }
 

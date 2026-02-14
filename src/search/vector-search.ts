@@ -1,10 +1,9 @@
-import { LanceStore } from "../storage/lance.js";
-import type { EmbeddingProvider } from "../embeddings/provider.js";
+import type { LanceStore } from "../storage/lance.js";
 import type { SearchResult } from "./hybrid.js";
 
 export async function vectorSearch(
   lance: LanceStore,
-  queryVector: Float32Array,
+  queryVector: number[],
   options: {
     limit?: number;
     languageFilter?: string;
@@ -13,7 +12,9 @@ export async function vectorSearch(
 ): Promise<SearchResult[]> {
   let filter: string | undefined;
   if (options.languageFilter) {
-    filter = `language = '${options.languageFilter}'`;
+    // Sanitize: only allow alphanumeric, hyphens, and underscores in language names
+    const sanitized = options.languageFilter.replace(/[^a-zA-Z0-9_-]/g, "");
+    filter = `language = '${sanitized}'`;
   }
 
   const results = await lance.vectorSearch(queryVector, {
@@ -26,7 +27,7 @@ export async function vectorSearch(
     startLine: r.start_line,
     endLine: r.end_line,
     content: r.content,
-    score: 1 / (1 + r._distance), // Convert distance to similarity score [0,1]
+    score: r._distance != null && r._distance >= 0 ? 1 / (1 + r._distance) : 0,
     matchType: "vector" as const,
     symbols: r.symbol_names ? r.symbol_names.split(" ").filter(Boolean) : [],
     language: r.language,

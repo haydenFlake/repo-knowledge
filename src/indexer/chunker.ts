@@ -37,16 +37,15 @@ export function chunkFile(
   const fileTokens = estimateTokens(source);
   if (fileTokens <= maxTokens) {
     const symbolNames = symbols.map((s) => s.name);
+    const content = buildChunkContent(filePath, source, 1, lines.length, symbolNames);
     return [
       {
         chunkIndex: 0,
-        content: buildChunkContent(filePath, source, 1, lines.length, symbolNames),
+        content,
         startLine: 1,
         endLine: lines.length,
         containedSymbolNames: symbolNames,
-        tokenCount: estimateTokens(
-          buildChunkContent(filePath, source, 1, lines.length, symbolNames),
-        ),
+        tokenCount: estimateTokens(content),
       },
     ];
   }
@@ -64,8 +63,8 @@ export function chunkFile(
   let currentLine = 1;
 
   for (const sym of topLevelSymbols) {
-    // Skip nested symbols (methods already covered by class)
-    if (sym.parentName && sym.kind !== "class") continue;
+    // Skip symbols that overlap with previous ones (already covered)
+    if (sym.startLine < currentLine) continue;
 
     // Gap before this symbol
     if (sym.startLine > currentLine) {
@@ -120,10 +119,14 @@ export function chunkFile(
   const chunks: CodeChunk[] = [];
   let chunkIndex = 0;
 
+  // Reserve tokens for the chunk header (// File: ... | Lines: ... | Symbols: ...)
+  const headerOverhead = 20;
+  const effectiveMax = maxTokens - headerOverhead;
+
   for (const region of regions) {
     const regionTokens = estimateTokens(region.text);
 
-    if (regionTokens <= maxTokens) {
+    if (regionTokens <= effectiveMax) {
       // Region fits in one chunk
       const content = buildChunkContent(
         filePath,

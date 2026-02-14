@@ -28,8 +28,10 @@ export function rankSymbols(sqlite: SqliteStore): void {
   }
 
   for (const e of edges) {
-    outLinks.get(e.source_symbol_id)!.push(e.target_symbol_id);
-    inLinks.get(e.target_symbol_id)!.push(e.source_symbol_id);
+    const outList = outLinks.get(e.source_symbol_id);
+    if (outList) outList.push(e.target_symbol_id);
+    const inList = inLinks.get(e.target_symbol_id);
+    if (inList) inList.push(e.source_symbol_id);
   }
 
   // Initialize scores
@@ -38,22 +40,41 @@ export function rankSymbols(sqlite: SqliteStore): void {
     scores.set(id, 1.0 / N);
   }
 
-  // Iterate PageRank
+  // Iterate PageRank (with dangling node redistribution)
   const dampingFactor = 0.85;
   const iterations = 20;
 
+  // Identify dangling nodes (no outgoing edges) -- they leak rank mass
+  const danglingNodes: number[] = [];
+  for (const id of symbolIds) {
+    if ((outLinks.get(id) ?? []).length === 0) {
+      danglingNodes.push(id);
+    }
+  }
+
   for (let iter = 0; iter < iterations; iter++) {
+    // Collect rank mass from dangling nodes and redistribute evenly
+    let danglingMass = 0;
+    for (const id of danglingNodes) {
+      danglingMass += scores.get(id) ?? 0;
+    }
+
     const newScores = new Map<number, number>();
 
     for (const id of symbolIds) {
       let inScore = 0;
-      for (const inId of inLinks.get(id)!) {
-        const outDegree = outLinks.get(inId)!.length;
+      const incoming = inLinks.get(id) ?? [];
+      for (const inId of incoming) {
+        const outDegree = (outLinks.get(inId) ?? []).length;
         if (outDegree > 0) {
-          inScore += scores.get(inId)! / outDegree;
+          inScore += (scores.get(inId) ?? 0) / outDegree;
         }
       }
-      newScores.set(id, (1 - dampingFactor) / N + dampingFactor * inScore);
+      // Add dangling node contribution (evenly distributed to all nodes)
+      newScores.set(
+        id,
+        (1 - dampingFactor) / N + dampingFactor * (inScore + danglingMass / N),
+      );
     }
 
     // Update scores

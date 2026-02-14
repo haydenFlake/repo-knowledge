@@ -43,7 +43,6 @@ export async function discoverFiles(
     absolute: false,
     dot: false,
     onlyFiles: true,
-    ignore: ignorePatterns,
   });
 
   const discovered: DiscoveredFile[] = [];

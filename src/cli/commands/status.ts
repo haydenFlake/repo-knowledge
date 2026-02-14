@@ -2,20 +2,24 @@ import { Project } from "../../core/project.js";
 import { isInitialized } from "../../core/config.js";
 import { logger } from "../../utils/logger.js";
 
-export async function statusCommand(): Promise<void> {
+interface StatusArgs {
+  dataDir?: string;
+}
+
+export async function statusCommand(args: StatusArgs = {}): Promise<void> {
   const projectRoot = process.cwd();
 
-  if (!isInitialized(projectRoot)) {
+  if (!isInitialized(projectRoot, args.dataDir)) {
     logger.error("Not initialized. Run 'repo-knowledge init' first.");
     process.exit(1);
   }
 
-  const project = await Project.open(projectRoot);
+  const project = await Project.open(projectRoot, args.dataDir);
 
   try {
     const stats = project.sqlite.getStats();
     const lastIndex = project.sqlite.getState("last_full_index");
-    const lastIncremental = project.sqlite.getState("last_incremental_index");
+    const lastIndexed = project.sqlite.getState("last_indexed");
     const embeddingModel = project.sqlite.getState("embedding_model");
 
     logger.info("repo-knowledge status");
@@ -40,8 +44,8 @@ export async function statusCommand(): Promise<void> {
     if (lastIndex) {
       logger.info(`  Last full index: ${lastIndex}`);
     }
-    if (lastIncremental) {
-      logger.info(`  Last incremental: ${lastIncremental}`);
+    if (lastIndexed && lastIndexed !== lastIndex) {
+      logger.info(`  Last indexed:    ${lastIndexed}`);
     }
 
     if (stats.totalFiles === 0) {

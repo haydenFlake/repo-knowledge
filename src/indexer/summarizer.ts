@@ -140,10 +140,17 @@ function generateProjectSummary(sqlite: SqliteStore): void {
   summary += `Languages: ${Object.entries(stats.languages).map(([l, c]) => `${l}(${c})`).join(", ")}\n`;
 
   if (topSymbols.length > 0) {
+    // Batch-load files to avoid N+1
+    const uniqueFileIds = [...new Set(topSymbols.map((s) => s.file_id))];
+    const fileCache = new Map<number, string>();
+    for (const fid of uniqueFileIds) {
+      const f = sqlite.getFileById(fid);
+      if (f) fileCache.set(fid, f.path);
+    }
+
     summary += `\nMost important symbols:\n`;
     for (const s of topSymbols.slice(0, 15)) {
-      const file = sqlite.getFileById(s.file_id);
-      summary += `  ${s.kind} ${s.name} [${file?.path ?? "?"}:${s.start_line}] importance=${s.importance_score.toFixed(2)}\n`;
+      summary += `  ${s.kind} ${s.name} [${fileCache.get(s.file_id) ?? "?"}:${s.start_line}] importance=${s.importance_score.toFixed(2)}\n`;
     }
   }
 

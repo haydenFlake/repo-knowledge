@@ -8,6 +8,8 @@ import {
   formatSearchResults,
   formatFileSummary,
   formatRepoOverview,
+  escapeXmlAttr,
+  escapeXmlContent,
 } from "../output/formatter.js";
 import { logger } from "../utils/logger.js";
 
@@ -24,10 +26,10 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
     "search_code",
     "Search the indexed codebase using hybrid search (semantic + keyword + symbol). Returns the most relevant code chunks with file paths, line numbers, and context.",
     {
-      query: z.string().describe("Natural language query or code snippet to search for"),
-      limit: z.number().optional().default(10).describe("Maximum number of results"),
-      token_budget: z.number().optional().default(4000).describe("Maximum tokens in response"),
-      language: z.string().optional().describe("Filter by language (e.g., 'typescript')"),
+      query: z.string().max(2000).describe("Natural language query or code snippet to search for"),
+      limit: z.number().int().min(1).max(100).optional().default(10).describe("Maximum number of results"),
+      token_budget: z.number().int().min(100).max(100000).optional().default(4000).describe("Maximum tokens in response"),
+      language: z.string().max(50).optional().describe("Filter by language (e.g., 'typescript')"),
       search_mode: z
         .enum(["hybrid", "vector", "keyword", "symbol"])
         .optional()
@@ -51,7 +53,7 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
     "get_file_summary",
     "Get a structured summary of a file including its purpose, exports, imports, key symbols with signatures, and line count. Much more token-efficient than reading the full file.",
     {
-      file_path: z.string().describe("Relative file path from project root"),
+      file_path: z.string().max(1000).describe("Relative file path from project root"),
     },
     async (args) => {
       const file = project.sqlite.getFileByPath(args.file_path);
@@ -79,7 +81,7 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
     "get_symbol",
     "Look up a specific symbol (function, class, interface, type) by name. Returns its full definition, signature, docstring, location, and relationships.",
     {
-      name: z.string().describe("Symbol name to look up"),
+      name: z.string().max(500).describe("Symbol name to look up"),
       kind: z
         .enum(["function", "class", "interface", "type", "method", "enum", "any"])
         .optional()
@@ -98,26 +100,41 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
         };
       }
       const file = project.sqlite.getFileById(symbol.file_id);
-      let output = `<symbol name="${symbol.name}" kind="${symbol.kind}" file="${file?.path ?? "?"}" lines="${symbol.start_line}-${symbol.end_line}">\n`;
+      let output = `<symbol name="${escapeXmlAttr(symbol.name)}" kind="${symbol.kind}" file="${escapeXmlAttr(file?.path ?? "?")}" lines="${symbol.start_line}-${symbol.end_line}">\n`;
       if (symbol.docstring) {
-        output += `  <docstring>${symbol.docstring}</docstring>\n`;
+        output += `  <docstring>${escapeXmlContent(symbol.docstring)}</docstring>\n`;
       }
-      output += `  <signature>${symbol.signature ?? symbol.name}</signature>\n`;
+      output += `  <signature>${escapeXmlContent(symbol.signature ?? symbol.name)}</signature>\n`;
       output += `  <importance>${symbol.importance_score.toFixed(2)}</importance>\n`;
 
       // Show callers/callees if graph edges exist
       if (symbol.id) {
         const outEdges = project.sqlite.getEdgesFrom(symbol.id);
         const inEdges = project.sqlite.getEdgesTo(symbol.id);
+
+        // Batch-load all referenced symbols and files to avoid N+1
+        const allSymbolIds = new Set<number>();
+        for (const e of outEdges.slice(0, 10)) allSymbolIds.add(e.target_symbol_id);
+        for (const e of inEdges.slice(0, 10)) allSymbolIds.add(e.source_symbol_id);
+        const symCache = new Map<number, { name: string; file_id: number; start_line: number }>();
+        const fileCache = new Map<number, string>();
+        for (const sid of allSymbolIds) {
+          const s = project.sqlite.getSymbolById(sid);
+          if (s) {
+            symCache.set(sid, { name: s.name, file_id: s.file_id, start_line: s.start_line });
+            if (!fileCache.has(s.file_id)) {
+              const f = project.sqlite.getFileById(s.file_id);
+              if (f) fileCache.set(s.file_id, f.path);
+            }
+          }
+        }
+
         if (outEdges.length > 0) {
           output += "  <calls>\n";
           for (const e of outEdges.slice(0, 10)) {
-            const target = project.sqlite
-              .getSymbolsByFile(e.target_file_id ?? 0)
-              .find((s) => s.id === e.target_symbol_id);
+            const target = symCache.get(e.target_symbol_id);
             if (target) {
-              const tf = project.sqlite.getFileById(target.file_id);
-              output += `    ${target.name} [${tf?.path ?? "?"}:${target.start_line}] (${e.edge_type})\n`;
+              output += `    ${target.name} [${fileCache.get(target.file_id) ?? "?"}:${target.start_line}] (${e.edge_type})\n`;
             }
           }
           output += "  </calls>\n";
@@ -125,12 +142,9 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
         if (inEdges.length > 0) {
           output += "  <called_by>\n";
           for (const e of inEdges.slice(0, 10)) {
-            const source = project.sqlite
-              .getSymbolsByFile(e.source_file_id ?? 0)
-              .find((s) => s.id === e.source_symbol_id);
+            const source = symCache.get(e.source_symbol_id);
             if (source) {
-              const sf = project.sqlite.getFileById(source.file_id);
-              output += `    ${source.name} [${sf?.path ?? "?"}:${source.start_line}] (${e.edge_type})\n`;
+              output += `    ${source.name} [${fileCache.get(source.file_id) ?? "?"}:${source.start_line}] (${e.edge_type})\n`;
             }
           }
           output += "  </called_by>\n";
@@ -147,12 +161,12 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
     "get_dependencies",
     "Explore the dependency graph starting from a symbol. Shows what this code depends on and what depends on it. Essential for understanding impact of changes.",
     {
-      symbol_name: z.string().describe("Symbol name to analyze"),
+      symbol_name: z.string().max(500).describe("Symbol name to analyze"),
       direction: z
         .enum(["dependencies", "dependents", "both"])
         .optional()
         .default("both"),
-      depth: z.number().optional().default(2).describe("How many hops to traverse (1-5)"),
+      depth: z.number().int().min(1).max(5).optional().default(2).describe("How many hops to traverse (1-5)"),
     },
     async (args) => {
       const result = getRelatedSymbols(project.sqlite, args.symbol_name, {
@@ -171,12 +185,12 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
         };
       }
 
-      let output = `<dependencies root="${result.root.name}" kind="${result.root.kind}" file="${result.root.filePath}:${result.root.startLine}">\n`;
+      let output = `<dependencies root="${escapeXmlAttr(result.root.name)}" kind="${result.root.kind}" file="${escapeXmlAttr(result.root.filePath)}:${result.root.startLine}">\n`;
 
       if (result.callees.length > 0) {
         output += "  <depends_on>\n";
         for (const c of result.callees) {
-          output += `    ${c.name} (${c.kind}) [${c.filePath}:${c.startLine}] depth=${c.depth}\n`;
+          output += `    ${escapeXmlContent(c.name)} (${c.kind}) [${escapeXmlContent(c.filePath)}:${c.startLine}] depth=${c.depth}\n`;
         }
         output += "  </depends_on>\n";
       }
@@ -184,7 +198,7 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
       if (result.callers.length > 0) {
         output += "  <depended_on_by>\n";
         for (const c of result.callers) {
-          output += `    ${c.name} (${c.kind}) [${c.filePath}:${c.startLine}] depth=${c.depth}\n`;
+          output += `    ${escapeXmlContent(c.name)} (${c.kind}) [${escapeXmlContent(c.filePath)}:${c.startLine}] depth=${c.depth}\n`;
         }
         output += "  </depended_on_by>\n";
       }
@@ -199,7 +213,7 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
     "get_repo_overview",
     "Get a high-level overview of the entire repository: structure, key modules, entry points, and most important symbols. Extremely token-efficient (~1K-5K tokens). Use this first to orient yourself.",
     {
-      token_budget: z.number().optional().default(2000),
+      token_budget: z.number().int().min(100).max(100000).optional().default(2000),
     },
     async (args) => {
       const stats = project.sqlite.getStats();
@@ -221,16 +235,17 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
     {
       task_description: z
         .string()
+        .max(2000)
         .describe("What you are trying to accomplish"),
       focus_files: z
-        .array(z.string())
+        .array(z.string().max(1000))
+        .max(20)
         .optional()
         .describe("Files you are currently editing"),
-      token_budget: z.number().optional().default(8000),
+      token_budget: z.number().int().min(100).max(100000).optional().default(8000),
     },
     async (args) => {
-      let output = `<context task="${args.task_description}" budget="${args.token_budget}">\n`;
-      let tokensUsed = 100;
+      let output = `<context task="${escapeXmlAttr(args.task_description)}" budget="${args.token_budget}">\n`;
 
       // Search for relevant code
       const searchBudget = Math.floor(args.token_budget * 0.6);
@@ -242,7 +257,6 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
 
       if (results.length > 0) {
         output += formatSearchResults(results, searchBudget) + "\n";
-        tokensUsed += searchBudget;
       }
 
       // Add focus file summaries
@@ -277,7 +291,8 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
     {},
     async () => {
       const stats = project.sqlite.getStats();
-      const lastIndex = project.sqlite.getState("last_full_index");
+      const lastFullIndex = project.sqlite.getState("last_full_index");
+      const lastIndexed = project.sqlite.getState("last_indexed");
       const model = project.sqlite.getState("embedding_model");
 
       let output = `<index_status>\n`;
@@ -285,13 +300,37 @@ export async function startMcpServer(projectRoot: string): Promise<void> {
       output += `  <symbols>${stats.totalSymbols}</symbols>\n`;
       output += `  <chunks>${stats.totalChunks}</chunks>\n`;
       output += `  <edges>${stats.totalEdges}</edges>\n`;
-      output += `  <last_indexed>${lastIndex ?? "never"}</last_indexed>\n`;
+      output += `  <last_indexed>${lastIndexed ?? lastFullIndex ?? "never"}</last_indexed>\n`;
+      if (lastFullIndex) {
+        output += `  <last_full_index>${lastFullIndex}</last_full_index>\n`;
+      }
       output += `  <embedding_model>${model ?? "none"}</embedding_model>\n`;
       output += `  <languages>${Object.entries(stats.languages).map(([l, c]) => `${l}:${c}`).join(", ")}</languages>\n`;
+      output += `  <note>The index may be stale if files have changed since last indexing. Run 'repo-knowledge index' to update.</note>\n`;
       output += `</index_status>`;
       return { content: [{ type: "text" as const, text: output }] };
     },
   );
+
+  // Cleanup on exit
+  let isCleaningUp = false;
+  const cleanup = () => {
+    if (isCleaningUp) return;
+    isCleaningUp = true;
+    // Close SQLite synchronously (the critical resource)
+    try {
+      project.sqlite.close();
+    } catch {
+      // Best-effort cleanup
+    }
+    // Dispose embedding model (async but best-effort, process is exiting)
+    if (project.hasEmbeddings) {
+      project.embeddings.dispose().catch(() => {});
+    }
+    process.exit(0);
+  };
+  process.on("SIGINT", cleanup);
+  process.on("SIGTERM", cleanup);
 
   // Start the server
   const transport = new StdioServerTransport();

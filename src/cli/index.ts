@@ -3,7 +3,19 @@ import { initCommand } from "./commands/init.js";
 import { statusCommand } from "./commands/status.js";
 import { indexCommand } from "./commands/index-cmd.js";
 import { searchCommand } from "./commands/search.js";
+import { queryCommand } from "./commands/query.js";
 import { serveCommand } from "./commands/serve.js";
+
+/** Wrap async action to catch unhandled rejections and exit cleanly */
+function asyncAction<T extends (...args: never[]) => Promise<void>>(fn: T): T {
+  return ((...args: Parameters<T>) => {
+    fn(...args).catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      console.error(`Error: ${message}`);
+      process.exit(1);
+    });
+  }) as T;
+}
 
 export function run(argv: string[]): void {
   const program = new Command()
@@ -23,7 +35,7 @@ export function run(argv: string[]): void {
     )
     .option("--data-dir <dir>", "Data directory", ".repo-knowledge")
     .option("--force", "Overwrite existing configuration")
-    .action(initCommand);
+    .action(asyncAction(initCommand));
 
   program
     .command("index")
@@ -32,7 +44,8 @@ export function run(argv: string[]): void {
     .option("--files <patterns...>", "Only index specific file patterns")
     .option("--summarize", "Generate hierarchical summaries")
     .option("--dry-run", "Show what would be indexed without doing it")
-    .action(indexCommand);
+    .option("--data-dir <dir>", "Data directory")
+    .action(asyncAction(indexCommand));
 
   program
     .command("search <query>")
@@ -47,18 +60,29 @@ export function run(argv: string[]): void {
     .option("-f, --file <pattern>", "Filter by file glob pattern")
     .option("--json", "Output as JSON")
     .option("--tokens <n>", "Token budget for output", "4000")
-    .action(searchCommand);
+    .option("--data-dir <dir>", "Data directory")
+    .action(asyncAction(searchCommand));
+
+  program
+    .command("query <task>")
+    .description("Assemble context for a coding task")
+    .option("--focus <files...>", "Files to focus on")
+    .option("--tokens <n>", "Token budget for output", "8000")
+    .option("--json", "Output as JSON")
+    .option("--data-dir <dir>", "Data directory")
+    .action(asyncAction(queryCommand));
 
   program
     .command("status")
     .description("Show index status and statistics")
-    .action(statusCommand);
+    .option("--data-dir <dir>", "Data directory")
+    .action(asyncAction(statusCommand));
 
   program
     .command("serve")
     .description("Start the MCP server (stdio transport)")
     .option("--project <dir>", "Project root directory")
-    .action(serveCommand);
+    .action(asyncAction(serveCommand));
 
   program.parse(argv);
 }

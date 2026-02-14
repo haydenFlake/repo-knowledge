@@ -7,16 +7,17 @@ import { logger } from "../utils/logger.js";
 
 const require = createRequire(import.meta.url);
 
-let initialized = false;
+let initPromise: Promise<void> | null = null;
 
 export class TreeSitterManager {
   private languages: Map<string, Parser.Language> = new Map();
+  private parsers: Map<string, Parser> = new Map();
 
   async initialize(): Promise<void> {
-    if (!initialized) {
-      await Parser.init();
-      initialized = true;
+    if (!initPromise) {
+      initPromise = Parser.init();
     }
+    await initPromise;
   }
 
   async getLanguage(languageId: string): Promise<Parser.Language | null> {
@@ -44,9 +45,13 @@ export class TreeSitterManager {
     }
   }
 
-  createParser(language: Parser.Language): Parser {
+  private getOrCreateParser(languageId: string, language: Parser.Language): Parser {
+    const cached = this.parsers.get(languageId);
+    if (cached) return cached;
+
     const parser = new Parser();
     parser.setLanguage(language);
+    this.parsers.set(languageId, parser);
     return parser;
   }
 
@@ -57,7 +62,7 @@ export class TreeSitterManager {
     const language = await this.getLanguage(languageId);
     if (!language) return null;
 
-    const parser = this.createParser(language);
+    const parser = this.getOrCreateParser(languageId, language);
     return parser.parse(source);
   }
 

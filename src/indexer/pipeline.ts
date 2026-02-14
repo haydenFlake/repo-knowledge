@@ -4,6 +4,9 @@ import { discoverFiles, type DiscoveredFile } from "./file-discovery.js";
 import { hashContent, computeDiff } from "./hasher.js";
 import { extractSymbols } from "./symbol-extractor.js";
 import { chunkFile, type CodeChunk } from "./chunker.js";
+import { buildGraph } from "./graph-builder.js";
+import { rankSymbols } from "./ranker.js";
+import { generateSummaries } from "./summarizer.js";
 import { batchEmbed } from "../embeddings/batch.js";
 import { TreeSitterManager } from "../parser/tree-sitter-manager.js";
 import { CODE_LANGUAGES } from "../parser/languages.js";
@@ -68,8 +71,13 @@ export async function runIndexingPipeline(
     };
   }
 
+  // Cache for file contents read during diff (avoids reading modified files twice)
+  const contentCache = new Map<string, { content: string; hash: string }>();
+
   // Phase 2: Incremental Diff
   let filesToProcess: DiscoveredFile[];
+  let addedFiles: DiscoveredFile[] = [];
+  let modifiedFiles: DiscoveredFile[] = [];
   let removedPaths: string[] = [];
   let unchangedCount = 0;
 
@@ -77,12 +85,16 @@ export async function runIndexingPipeline(
     logger.info("Phase 2: Full re-index (clearing existing data)...");
     sqlite.clearAllData();
     filesToProcess = discovered;
+    addedFiles = discovered;
   } else {
     logger.info("Phase 2: Computing incremental diff...");
     const existingHashes = sqlite.getFileHashes();
-    const diff = computeDiff(discovered, existingHashes);
+    const existingSizes = sqlite.getFileSizes();
+    const diff = computeDiff(discovered, existingHashes, contentCache, existingSizes);
 
-    filesToProcess = [...diff.added, ...diff.modified];
+    addedFiles = diff.added;
+    modifiedFiles = diff.modified;
+    filesToProcess = [...addedFiles, ...modifiedFiles];
     removedPaths = diff.removed;
     unchangedCount = diff.unchanged.length;
 
@@ -91,20 +103,38 @@ export async function runIndexingPipeline(
         `Removed: ${diff.removed.length}, Unchanged: ${diff.unchanged.length}`,
     );
 
-    // Remove deleted files from index
-    if (diff.removed.length > 0) {
-      sqlite.deleteFilesByPaths(diff.removed);
+    // Clean up LanceDB vectors for removed and modified files
+    if (diff.removed.length > 0 || diff.modified.length > 0) {
+      const lance = await project.getLance();
+
+      // Remove stale vectors for deleted files
+      for (const removedPath of diff.removed) {
+        await lance.deleteByFilePath(removedPath);
+      }
+
+      // Clean up modified files (will be re-indexed)
+      // Defer FTS rebuild until after all deletes to avoid O(total_records * N)
+      for (const file of diff.modified) {
+        const existing = sqlite.getFileByPath(file.relativePath);
+        if (existing?.id) {
+          sqlite.deleteSymbolsByFile(existing.id, false);
+          sqlite.deleteChunksByFile(existing.id, false);
+          sqlite.deleteEdgesByFile(existing.id);
+          sqlite.deleteFileDependenciesByFile(existing.id);
+        }
+        await lance.deleteByFilePath(file.relativePath);
+      }
+
+      // Rebuild FTS once after all deletes
+      if (diff.modified.length > 0) {
+        sqlite.rebuildSymbolsFts();
+        sqlite.rebuildChunksFts();
+      }
     }
 
-    // Clean up modified files (will be re-indexed)
-    for (const file of diff.modified) {
-      const existing = sqlite.getFileByPath(file.relativePath);
-      if (existing?.id) {
-        sqlite.deleteSymbolsByFile(existing.id);
-        sqlite.deleteChunksByFile(existing.id);
-        sqlite.deleteEdgesByFile(existing.id);
-        sqlite.deleteFileDependenciesByFile(existing.id);
-      }
+    // Remove deleted files from SQLite (after LanceDB cleanup)
+    if (diff.removed.length > 0) {
+      sqlite.deleteFilesByPaths(diff.removed);
     }
   }
 
@@ -131,40 +161,48 @@ export async function runIndexingPipeline(
   const parsedFiles: ParsedFile[] = [];
 
   for (const file of filesToProcess) {
-    const source = fs.readFileSync(file.absolutePath, "utf-8");
-    const contentHash = hashContent(source);
-    const lineCount = source.split("\n").length;
+    try {
+      // Use cached content if available (from computeDiff), otherwise read from disk
+      const cached = contentCache.get(file.relativePath);
+      const source = cached?.content ?? fs.readFileSync(file.absolutePath, "utf-8");
+      const contentHash = cached?.hash ?? hashContent(source);
 
-    let symbols: ExtractedSymbol[] = [];
-    let imports: ImportDeclaration[] = [];
+      let symbols: ExtractedSymbol[] = [];
+      let imports: ImportDeclaration[] = [];
 
-    // Only extract symbols from code languages (not JSON, YAML, etc.)
-    if (file.language && CODE_LANGUAGES.has(file.language)) {
-      const tree = await tsManager.parse(source, file.language);
-      if (tree) {
-        const result = extractSymbols(tree, source, file.language);
-        symbols = result.symbols;
-        imports = result.imports;
+      // Only extract symbols from code languages (not JSON, YAML, etc.)
+      if (file.language && CODE_LANGUAGES.has(file.language)) {
+        const tree = await tsManager.parse(source, file.language);
+        if (tree) {
+          const result = extractSymbols(tree, source, file.language);
+          symbols = result.symbols;
+          imports = result.imports;
+        }
       }
+
+      // Phase 4: Chunk
+      const chunks = chunkFile(
+        source,
+        file.relativePath,
+        symbols,
+        config.chunkMaxTokens,
+      );
+
+      parsedFiles.push({
+        file,
+        source,
+        contentHash,
+        symbols,
+        imports,
+        chunks,
+      });
+    } catch (err) {
+      logger.warn(`  Failed to process ${file.relativePath}: ${err}`);
     }
-
-    // Phase 4: Chunk
-    const chunks = chunkFile(
-      source,
-      file.relativePath,
-      symbols,
-      config.chunkMaxTokens,
-    );
-
-    parsedFiles.push({
-      file,
-      source,
-      contentHash,
-      symbols,
-      imports,
-      chunks,
-    });
   }
+
+  // Free memory from content cache
+  contentCache.clear();
 
   logger.info(
     `  Extracted ${parsedFiles.reduce((a, p) => a + p.symbols.length, 0)} symbols, ` +
@@ -191,10 +229,17 @@ export async function runIndexingPipeline(
       language: parsed.file.language,
       size_bytes: parsed.file.sizeBytes,
       content_hash: parsed.contentHash,
-      line_count: parsed.source.split("\n").length,
+      line_count: parsed.source.endsWith("\n")
+        ? parsed.source.split("\n").length - 1
+        : parsed.source.split("\n").length,
       summary: null,
       purpose: null,
     });
+
+    if (fileId === 0) {
+      logger.warn(`  Failed to upsert file: ${parsed.file.relativePath}`);
+      continue;
+    }
 
     // Insert symbols
     const symbolRecords: SymbolRecord[] = parsed.symbols.map((s) => ({
@@ -206,42 +251,63 @@ export async function runIndexingPipeline(
       end_line: s.endLine,
       start_col: s.startCol,
       end_col: s.endCol,
-      parent_symbol_id: null, // TODO: resolve parent references
+      parent_symbol_id: null,
       docstring: s.docstring ?? null,
       exported: s.exported ? 1 : 0,
       importance_score: 0,
     }));
 
-    sqlite.insertSymbols(symbolRecords);
+    const insertedIds = sqlite.insertSymbols(symbolRecords);
 
-    // Insert chunks
-    for (const chunk of parsed.chunks) {
-      const chunkRecord: ChunkRecord = {
-        file_id: fileId,
-        chunk_index: chunk.chunkIndex,
-        content: chunk.content,
-        content_hash: hashContent(chunk.content),
-        start_line: chunk.startLine,
-        end_line: chunk.endLine,
-        symbol_ids: JSON.stringify(chunk.containedSymbolNames),
-        token_count: chunk.tokenCount,
-        embedding_model: null,
-        embedded_at: null,
-        lance_row_id: null,
-      };
-      const chunkId = sqlite.insertChunk(chunkRecord);
-
-      allChunksForEmbedding.push({
-        chunkId,
-        content: chunk.content,
-        fileId,
-        filePath: parsed.file.relativePath,
-        language: parsed.file.language ?? "unknown",
-        startLine: chunk.startLine,
-        endLine: chunk.endLine,
-        symbolNames: chunk.containedSymbolNames.join(" "),
-      });
+    // Resolve parent_symbol_id for nested symbols (e.g., methods inside classes)
+    // Only store top-level symbols (those without a parent) as potential parents
+    // to avoid collisions between methods with the same name across different classes
+    const parentNameToId = new Map<string, number>();
+    for (let i = 0; i < parsed.symbols.length; i++) {
+      if (!parsed.symbols[i].parentName) {
+        parentNameToId.set(parsed.symbols[i].name, insertedIds[i]);
+      }
     }
+    for (let i = 0; i < parsed.symbols.length; i++) {
+      const sym = parsed.symbols[i];
+      if (sym.parentName) {
+        const parentId = parentNameToId.get(sym.parentName);
+        if (parentId) {
+          sqlite.updateSymbolParent(insertedIds[i], parentId);
+        }
+      }
+    }
+
+    // Insert chunks (wrapped in transaction for performance)
+    sqlite.transaction(() => {
+      for (const chunk of parsed.chunks) {
+        const chunkRecord: ChunkRecord = {
+          file_id: fileId,
+          chunk_index: chunk.chunkIndex,
+          content: chunk.content,
+          content_hash: hashContent(chunk.content),
+          start_line: chunk.startLine,
+          end_line: chunk.endLine,
+          symbol_ids: chunk.containedSymbolNames.join(" "),
+          token_count: chunk.tokenCount,
+          embedding_model: null,
+          embedded_at: null,
+          lance_row_id: null,
+        };
+        const chunkId = sqlite.insertChunk(chunkRecord, parsed.file.relativePath);
+
+        allChunksForEmbedding.push({
+          chunkId,
+          content: chunk.content,
+          fileId,
+          filePath: parsed.file.relativePath,
+          language: parsed.file.language ?? "unknown",
+          startLine: chunk.startLine,
+          endLine: chunk.endLine,
+          symbolNames: chunk.containedSymbolNames.join(" "),
+        });
+      }
+    });
   }
 
   // Phase 6: Embed chunks and store in LanceDB
@@ -267,7 +333,7 @@ export async function runIndexingPipeline(
   // Build LanceDB records
   const lanceRecords: ChunkEmbeddingRecord[] = allChunksForEmbedding.map(
     (c, i) => ({
-      vector: Array.from(vectors[i]),
+      vector: vectors[i],
       chunk_id: c.chunkId,
       file_id: c.fileId,
       file_path: c.filePath,
@@ -280,30 +346,51 @@ export async function runIndexingPipeline(
   );
 
   if (lanceRecords.length > 0) {
-    const { LanceStore } = await import("../storage/lance.js");
-    const lance = new LanceStore();
-    await lance.connect(config.projectRoot);
-    await lance.createTable(lanceRecords);
-    await lance.close();
+    const lance = await project.getLance();
+    if (options.full) {
+      await lance.createTable(lanceRecords);
+    } else {
+      await lance.addRecords(lanceRecords);
+    }
     logger.info(`  Stored ${lanceRecords.length} embeddings in LanceDB`);
   }
 
+  // Phase 7: Build graph
+  logger.info("Phase 7: Building knowledge graph...");
+  const graphData = parsedFiles.map((p) => {
+    const fileRecord = sqlite.getFileByPath(p.file.relativePath);
+    return {
+      fileId: fileRecord?.id ?? 0,
+      filePath: p.file.relativePath,
+      symbols: p.symbols,
+      imports: p.imports,
+    };
+  }).filter((d) => d.fileId > 0);
+  buildGraph(sqlite, graphData);
+
+  // Phase 8: Rank symbols by importance
+  logger.info("Phase 8: Running PageRank on symbol graph...");
+  rankSymbols(sqlite);
+
+  // Phase 9: Generate summaries (only when explicitly requested)
+  if (options.generateSummaries) {
+    logger.info("Phase 9: Generating summaries...");
+    generateSummaries(sqlite);
+  }
+
   // Update index state
-  sqlite.setState("last_full_index", new Date().toISOString());
+  sqlite.setState("last_indexed", new Date().toISOString());
+  if (options.full) {
+    sqlite.setState("last_full_index", new Date().toISOString());
+  }
   sqlite.setState("embedding_model", config.embeddingModel);
-  sqlite.setState("total_files", String(parsedFiles.length));
-  sqlite.setState(
-    "total_chunks",
-    String(allChunksForEmbedding.length),
-  );
+  const stats = sqlite.getStats();
+  sqlite.setState("total_files", String(stats.totalFiles));
+  sqlite.setState("total_chunks", String(stats.totalChunks));
 
   const result: IndexResult = {
-    filesAdded: options.full
-      ? filesToProcess.length
-      : filesToProcess.filter((f) =>
-          !sqlite.getFileByPath(f.relativePath),
-        ).length,
-    filesModified: options.full ? 0 : filesToProcess.length,
+    filesAdded: addedFiles.length,
+    filesModified: modifiedFiles.length,
     filesRemoved: removedPaths.length,
     filesUnchanged: unchangedCount,
     totalSymbols: parsedFiles.reduce((a, p) => a + p.symbols.length, 0),

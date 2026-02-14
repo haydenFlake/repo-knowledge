@@ -8,9 +8,15 @@ export interface LanguageConfig {
 export const LANGUAGES: Record<string, LanguageConfig> = {
   typescript: {
     id: "typescript",
-    extensions: [".ts", ".tsx"],
+    extensions: [".ts"],
     treeSitterPackage: "tree-sitter-typescript",
     wasmFile: "tree-sitter-typescript.wasm",
+  },
+  tsx: {
+    id: "tsx",
+    extensions: [".tsx"],
+    treeSitterPackage: "tree-sitter-tsx",
+    wasmFile: "tree-sitter-tsx.wasm",
   },
   javascript: {
     id: "javascript",
@@ -44,7 +50,7 @@ export const LANGUAGES: Record<string, LanguageConfig> = {
   },
   css: {
     id: "css",
-    extensions: [".css", ".scss", ".less"],
+    extensions: [".css"],
     treeSitterPackage: "tree-sitter-css",
     wasmFile: "tree-sitter-css.wasm",
   },
@@ -68,7 +74,7 @@ export const LANGUAGES: Record<string, LanguageConfig> = {
   },
   markdown: {
     id: "markdown",
-    extensions: [".md", ".mdx"],
+    extensions: [".md"],
     treeSitterPackage: "tree-sitter-markdown",
     wasmFile: "tree-sitter-markdown.wasm",
   },
@@ -82,7 +88,11 @@ for (const lang of Object.values(LANGUAGES)) {
 }
 
 export function detectLanguage(filePath: string): string | null {
-  const ext = filePath.substring(filePath.lastIndexOf(".")).toLowerCase();
+  const basename = filePath.split("/").pop() ?? filePath;
+  const dotIndex = basename.lastIndexOf(".");
+  // No extension, or dotfile without a further extension (e.g., ".gitignore")
+  if (dotIndex <= 0) return null;
+  const ext = basename.substring(dotIndex).toLowerCase();
   const lang = extensionMap.get(ext);
   return lang?.id ?? null;
 }
@@ -99,6 +109,7 @@ export function getLanguageConfig(
  */
 export const CODE_LANGUAGES = new Set([
   "typescript",
+  "tsx",
   "javascript",
   "python",
   "rust",

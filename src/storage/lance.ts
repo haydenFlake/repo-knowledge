@@ -1,9 +1,9 @@
+import * as path from "node:path";
 import * as lancedb from "@lancedb/lancedb";
-import { getVectorsDir } from "../core/config.js";
 
 export interface ChunkEmbeddingRecord {
   [key: string]: unknown;
-  vector: number[] | Float32Array;
+  vector: number[];
   chunk_id: number;
   file_id: number;
   file_path: string;
@@ -18,8 +18,8 @@ export class LanceStore {
   private db: lancedb.Connection | null = null;
   private table: lancedb.Table | null = null;
 
-  async connect(projectRoot: string): Promise<void> {
-    const vectorsDir = getVectorsDir(projectRoot);
+  async connect(dataDir: string): Promise<void> {
+    const vectorsDir = path.join(dataDir, "vectors");
     this.db = await lancedb.connect(vectorsDir);
   }
 
@@ -48,14 +48,36 @@ export class LanceStore {
 
   async addRecords(records: ChunkEmbeddingRecord[]): Promise<void> {
     if (!this.table) {
-      await this.createTable(records);
-      return;
+      const existing = await this.ensureTable();
+      if (!existing) {
+        // No table exists yet, create one
+        await this.createTable(records);
+        return;
+      }
     }
-    await this.table.add(records);
+    await this.table!.add(records);
+  }
+
+  private async deleteByFilter(filter: string): Promise<void> {
+    if (!this.table) {
+      const existing = await this.ensureTable();
+      if (!existing) return;
+    }
+    await this.table!.delete(filter);
+  }
+
+  async deleteByFilePath(filePath: string): Promise<void> {
+    if (!this.table) {
+      const existing = await this.ensureTable();
+      if (!existing) return;
+    }
+    // Escape single quotes and backslashes for SQL filter
+    const escaped = filePath.replace(/\\/g, "\\\\").replace(/'/g, "''");
+    await this.table!.delete(`file_path = '${escaped}'`);
   }
 
   async vectorSearch(
-    queryVector: Float32Array,
+    queryVector: number[],
     options: {
       limit?: number;
       filter?: string;

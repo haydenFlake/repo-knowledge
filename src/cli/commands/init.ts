@@ -14,6 +14,7 @@ export async function initCommand(args: InitArgs): Promise<void> {
   try {
     const project = await Project.init(projectRoot, {
       embeddingModel: args.model,
+      dataDir: args.dataDir,
       force: args.force,
     });
 

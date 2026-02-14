@@ -19,10 +19,11 @@ export function extractSymbols(
   const symbols: ExtractedSymbol[] = [];
   const imports: ImportDeclaration[] = [];
 
-  const isTS = language === "typescript" || language === "javascript";
+  const isTS = language === "typescript" || language === "tsx" || language === "javascript";
   const isPython = language === "python";
   const isRust = language === "rust";
   const isGo = language === "go";
+  const isJava = language === "java";
 
   function getNodeText(node: Parser.SyntaxNode): string {
     return source.slice(node.startIndex, node.endIndex);
@@ -50,12 +51,6 @@ export function extractSymbols(
     if (!isTS) return true; // Non-TS languages: treat top-level as exported
     const parent = node.parent;
     if (parent?.type === "export_statement") return true;
-    // Check if wrapped in export
-    if (parent?.type === "program") {
-      // Check for 'export' keyword at same position
-      const prev = node.previousSibling;
-      if (prev?.type === "export") return true;
-    }
     return false;
   }
 
@@ -91,8 +86,6 @@ export function extractSymbols(
     node: Parser.SyntaxNode,
     parentName?: string,
   ): void {
-    const type = node.type;
-
     // TypeScript / JavaScript
     if (isTS) {
       extractTS(node, parentName);
@@ -102,6 +95,8 @@ export function extractSymbols(
       extractRust(node, parentName);
     } else if (isGo) {
       extractGo(node, parentName);
+    } else if (isJava) {
+      extractJava(node, parentName);
     }
   }
 
@@ -161,7 +156,7 @@ export function extractSymbols(
     if (type === "function_declaration") {
       const nameNode = node.childForFieldName("name");
       if (nameNode) {
-        const exp = isExported(node) || isExported(node.parent!);
+        const exp = isExported(node) || (node.parent ? isExported(node.parent) : false);
         symbols.push({
           name: getNodeText(nameNode),
           kind: "function",
@@ -189,7 +184,7 @@ export function extractSymbols(
           const nameNode = declarator.childForFieldName("name");
           const valueNode = declarator.childForFieldName("value");
           if (nameNode && valueNode?.type === "arrow_function") {
-            const exp = isExported(node) || isExported(node.parent!);
+            const exp = isExported(node) || (node.parent ? isExported(node.parent) : false);
             symbols.push({
               name: getNodeText(nameNode),
               kind: "function",
@@ -203,10 +198,10 @@ export function extractSymbols(
               exported: exp,
               bodyText: getNodeText(node),
             });
-            return;
           }
         }
       }
+      return;
     }
 
     // Classes
@@ -214,7 +209,7 @@ export function extractSymbols(
       const nameNode = node.childForFieldName("name");
       if (nameNode) {
         const className = getNodeText(nameNode);
-        const exp = isExported(node) || isExported(node.parent!);
+        const exp = isExported(node) || (node.parent ? isExported(node.parent) : false);
         symbols.push({
           name: className,
           kind: "class",
@@ -279,7 +274,7 @@ export function extractSymbols(
     if (type === "interface_declaration") {
       const nameNode = node.childForFieldName("name");
       if (nameNode) {
-        const exp = isExported(node) || isExported(node.parent!);
+        const exp = isExported(node) || (node.parent ? isExported(node.parent) : false);
         symbols.push({
           name: getNodeText(nameNode),
           kind: "interface",
@@ -301,7 +296,7 @@ export function extractSymbols(
     if (type === "type_alias_declaration") {
       const nameNode = node.childForFieldName("name");
       if (nameNode) {
-        const exp = isExported(node) || isExported(node.parent!);
+        const exp = isExported(node) || (node.parent ? isExported(node.parent) : false);
         symbols.push({
           name: getNodeText(nameNode),
           kind: "type",
@@ -323,7 +318,7 @@ export function extractSymbols(
     if (type === "enum_declaration") {
       const nameNode = node.childForFieldName("name");
       if (nameNode) {
-        const exp = isExported(node) || isExported(node.parent!);
+        const exp = isExported(node) || (node.parent ? isExported(node.parent) : false);
         symbols.push({
           name: getNodeText(nameNode),
           kind: "enum",
@@ -435,22 +430,51 @@ export function extractSymbols(
           startCol: node.startPosition.column,
           endCol: node.endPosition.column,
           parentName,
-          docstring: getDocstring(node),
+          docstring: (() => {
+            // Python: class docstring is the first expression_statement > string in the body
+            const classBody = node.childForFieldName("body");
+            if (classBody?.firstNamedChild?.type === "expression_statement") {
+              const expr = classBody.firstNamedChild.firstNamedChild;
+              if (expr?.type === "string") {
+                return getNodeText(expr)
+                  .replace(/^['"]{3}/, "")
+                  .replace(/['"]{3}$/, "")
+                  .trim();
+              }
+            }
+            return getDocstring(node); // fallback to comment-before-class
+          })(),
           exported: !className.startsWith("_"),
           bodyText: getNodeText(node),
         });
 
-        // Extract methods
+        // Extract methods (including decorated ones)
         const body = node.childForFieldName("body");
         if (body) {
           for (const child of body.namedChildren) {
             if (child.type === "function_definition") {
               extractPython(child, className);
+            } else if (child.type === "decorated_definition") {
+              for (const inner of child.namedChildren) {
+                if (inner.type === "function_definition") {
+                  extractPython(inner, className);
+                }
+              }
             }
           }
         }
         return;
       }
+    }
+
+    // Decorated definitions: unwrap to the inner function/class
+    if (type === "decorated_definition") {
+      for (const child of node.namedChildren) {
+        if (child.type === "function_definition" || child.type === "class_definition") {
+          extractPython(child, parentName);
+        }
+      }
+      return;
     }
 
     // Recurse for module level
@@ -604,7 +628,7 @@ export function extractSymbols(
           endCol: node.endPosition.column,
           parentName,
           docstring: getDocstring(node),
-          exported: name[0] === name[0].toUpperCase(),
+          exported: /^[A-Z]/.test(name),
           bodyText: getNodeText(node),
         });
       }
@@ -633,7 +657,7 @@ export function extractSymbols(
           endCol: node.endPosition.column,
           parentName: receiver,
           docstring: getDocstring(node),
-          exported: name[0] === name[0].toUpperCase(),
+          exported: /^[A-Z]/.test(name),
           bodyText: getNodeText(node),
         });
       }
@@ -663,7 +687,7 @@ export function extractSymbols(
               endCol: spec.endPosition.column,
               parentName,
               docstring: getDocstring(node),
-              exported: name[0] === name[0].toUpperCase(),
+              exported: /^[A-Z]/.test(name),
               bodyText: getNodeText(spec),
             });
           }
@@ -675,6 +699,150 @@ export function extractSymbols(
     if (type === "source_file") {
       for (const child of node.namedChildren) {
         extractGo(child, parentName);
+      }
+    }
+  }
+
+  function extractJava(
+    node: Parser.SyntaxNode,
+    parentName?: string,
+  ): void {
+    const type = node.type;
+
+    if (type === "import_declaration") {
+      const pathNodes = node.descendantsOfType("scoped_identifier");
+      const pathNode = pathNodes.at(0) ?? node.descendantsOfType("identifier").at(0);
+      if (pathNode) {
+        const source = getNodeText(pathNode);
+        const parts = source.split(".");
+        const name = parts[parts.length - 1];
+        imports.push({
+          source,
+          names: name === "*" ? [] : [name],
+          isDefault: false,
+          isNamespace: name === "*",
+          line: node.startPosition.row + 1,
+        });
+      }
+      return;
+    }
+
+    if (type === "class_declaration") {
+      const nameNode = node.childForFieldName("name");
+      if (nameNode) {
+        const className = getNodeText(nameNode);
+        const isPublic = node.children.some(
+          (c) => c.type === "modifiers" && getNodeText(c).includes("public"),
+        );
+        symbols.push({
+          name: className,
+          kind: "class",
+          signature: getSignature(node, "class"),
+          startLine: node.startPosition.row + 1,
+          endLine: node.endPosition.row + 1,
+          startCol: node.startPosition.column,
+          endCol: node.endPosition.column,
+          parentName,
+          docstring: getDocstring(node),
+          exported: isPublic,
+          bodyText: getNodeText(node),
+        });
+
+        // Extract methods and fields
+        const body = node.childForFieldName("body");
+        if (body) {
+          for (const member of body.namedChildren) {
+            if (member.type === "method_declaration" || member.type === "constructor_declaration") {
+              const methodName = member.childForFieldName("name");
+              const isConstructor = member.type === "constructor_declaration";
+              if (methodName || isConstructor) {
+                const name = isConstructor
+                  ? `${className}.<init>`
+                  : getNodeText(methodName!);
+                symbols.push({
+                  name,
+                  kind: "method",
+                  signature: getSignature(member, "method"),
+                  startLine: member.startPosition.row + 1,
+                  endLine: member.endPosition.row + 1,
+                  startCol: member.startPosition.column,
+                  endCol: member.endPosition.column,
+                  parentName: className,
+                  docstring: getDocstring(member),
+                  exported: isPublic,
+                  bodyText: getNodeText(member),
+                });
+              }
+            }
+            if (member.type === "field_declaration") {
+              for (const declarator of member.descendantsOfType("variable_declarator")) {
+                const fieldName = declarator.childForFieldName("name");
+                if (fieldName) {
+                  symbols.push({
+                    name: getNodeText(fieldName),
+                    kind: "property",
+                    signature: getNodeText(member).slice(0, 200),
+                    startLine: member.startPosition.row + 1,
+                    endLine: member.endPosition.row + 1,
+                    startCol: member.startPosition.column,
+                    endCol: member.endPosition.column,
+                    parentName: className,
+                    docstring: undefined,
+                    exported: isPublic,
+                    bodyText: getNodeText(member),
+                  });
+                }
+              }
+            }
+          }
+        }
+        return;
+      }
+    }
+
+    if (type === "interface_declaration") {
+      const nameNode = node.childForFieldName("name");
+      if (nameNode) {
+        symbols.push({
+          name: getNodeText(nameNode),
+          kind: "interface",
+          signature: getSignature(node, "interface"),
+          startLine: node.startPosition.row + 1,
+          endLine: node.endPosition.row + 1,
+          startCol: node.startPosition.column,
+          endCol: node.endPosition.column,
+          parentName,
+          docstring: getDocstring(node),
+          exported: true,
+          bodyText: getNodeText(node),
+        });
+      }
+      return;
+    }
+
+    if (type === "enum_declaration") {
+      const nameNode = node.childForFieldName("name");
+      if (nameNode) {
+        symbols.push({
+          name: getNodeText(nameNode),
+          kind: "enum",
+          signature: getSignature(node, "type"),
+          startLine: node.startPosition.row + 1,
+          endLine: node.endPosition.row + 1,
+          startCol: node.startPosition.column,
+          endCol: node.endPosition.column,
+          parentName,
+          docstring: getDocstring(node),
+          exported: true,
+          bodyText: getNodeText(node),
+        });
+      }
+      return;
+    }
+
+    if (type === "program") {
+      for (const child of node.namedChildren) {
+        extractJava(child, parentName);
       }
     }
   }

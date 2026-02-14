@@ -6,11 +6,6 @@ export function hashContent(content: string): string {
   return crypto.createHash("sha256").update(content).digest("hex");
 }
 
-export function hashFile(absolutePath: string): string {
-  const content = fs.readFileSync(absolutePath, "utf-8");
-  return hashContent(content);
-}
-
 export interface FileDiff {
   added: DiscoveredFile[];
   modified: DiscoveredFile[];
@@ -18,9 +13,16 @@ export interface FileDiff {
   unchanged: string[];
 }
 
+/**
+ * Compute diff between discovered files and existing indexed hashes.
+ * Caches file content + hashes to avoid reading files twice.
+ * Uses file size + mtime as a fast pre-check before hashing.
+ */
 export function computeDiff(
   discovered: DiscoveredFile[],
   existingHashes: Map<string, string>,
+  contentCache: Map<string, { content: string; hash: string }>,
+  existingSizes?: Map<string, number>,
 ): FileDiff {
   const added: DiscoveredFile[] = [];
   const modified: DiscoveredFile[] = [];
@@ -36,7 +38,20 @@ export function computeDiff(
       continue;
     }
 
-    const currentHash = hashFile(file.absolutePath);
+    // Fast check: if file size changed, it's definitely modified (skip reading + hashing)
+    if (existingSizes) {
+      const existingSize = existingSizes.get(file.relativePath);
+      if (existingSize !== undefined && existingSize !== file.sizeBytes) {
+        modified.push(file);
+        continue;
+      }
+    }
+
+    // Read and hash the file, cache the result
+    const content = fs.readFileSync(file.absolutePath, "utf-8");
+    const currentHash = hashContent(content);
+    contentCache.set(file.relativePath, { content, hash: currentHash });
+
     if (currentHash !== existingHash) {
       modified.push(file);
     } else {

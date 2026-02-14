@@ -1,5 +1,5 @@
+import * as path from "node:path";
 import Database from "better-sqlite3";
-import { getSqlitePath } from "../core/config.js";
 
 export interface FileRecord {
   id?: number;
@@ -188,8 +188,8 @@ CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
 export class SqliteStore {
   private db: Database.Database;
 
-  constructor(projectRoot: string) {
-    const dbPath = getSqlitePath(projectRoot);
+  constructor(dataDir: string) {
+    const dbPath = path.join(dataDir, "metadata.db");
     this.db = new Database(dbPath);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
@@ -214,7 +214,7 @@ export class SqliteStore {
   // === Files ===
 
   upsertFile(file: FileRecord): number {
-    const stmt = this.db.prepare(`
+    this.db.prepare(`
       INSERT INTO files (path, language, size_bytes, content_hash, line_count, summary, purpose)
       VALUES (@path, @language, @size_bytes, @content_hash, @line_count, @summary, @purpose)
       ON CONFLICT(path) DO UPDATE SET
@@ -225,9 +225,12 @@ export class SqliteStore {
         line_count = @line_count,
         summary = @summary,
         purpose = @purpose
-    `);
-    const result = stmt.run(file);
-    return Number(result.lastInsertRowid);
+    `).run(file);
+    // Always look up the actual ID to handle both insert and update paths
+    const row = this.db
+      .prepare("SELECT id FROM files WHERE path = ?")
+      .get(file.path) as { id: number } | undefined;
+    return row?.id ?? 0;
   }
 
   getFileByPath(filePath: string): FileRecord | undefined {
@@ -260,8 +263,18 @@ export class SqliteStore {
     return new Map(rows.map((r) => [r.path, r.content_hash]));
   }
 
+  getFileSizes(): Map<string, number> {
+    const rows = this.db
+      .prepare("SELECT path, size_bytes FROM files")
+      .all() as Array<{ path: string; size_bytes: number }>;
+    return new Map(rows.map((r) => [r.path, r.size_bytes]));
+  }
+
   deleteFile(filePath: string): void {
     this.db.prepare("DELETE FROM files WHERE path = ?").run(filePath);
+    // FTS5 tables don't participate in CASCADE; rebuild to remove orphans
+    this.rebuildSymbolsFts();
+    this.rebuildChunksFts();
   }
 
   deleteFilesByPaths(paths: string[]): void {
@@ -271,6 +284,9 @@ export class SqliteStore {
       for (const p of ps) del.run(p);
     });
     tx(paths);
+    // FTS5 tables don't participate in CASCADE; rebuild to remove orphans
+    this.rebuildSymbolsFts();
+    this.rebuildChunksFts();
   }
 
   // === Symbols ===
@@ -320,13 +336,14 @@ export class SqliteStore {
     name: string,
     kind?: string,
   ): SymbolRecord | undefined {
+    // Prefer exported symbols with highest importance to avoid arbitrary matches
     if (kind && kind !== "any") {
       return this.db
-        .prepare("SELECT * FROM symbols WHERE name = ? AND kind = ? LIMIT 1")
+        .prepare("SELECT * FROM symbols WHERE name = ? AND kind = ? ORDER BY exported DESC, importance_score DESC LIMIT 1")
         .get(name, kind) as SymbolRecord | undefined;
     }
     return this.db
-      .prepare("SELECT * FROM symbols WHERE name = ? LIMIT 1")
+      .prepare("SELECT * FROM symbols WHERE name = ? ORDER BY exported DESC, importance_score DESC LIMIT 1")
       .get(name) as SymbolRecord | undefined;
   }
 
@@ -343,6 +360,18 @@ export class SqliteStore {
     return rows;
   }
 
+  getSymbolById(id: number): SymbolRecord | undefined {
+    return this.db.prepare("SELECT * FROM symbols WHERE id = ?").get(id) as
+      | SymbolRecord
+      | undefined;
+  }
+
+  updateSymbolParent(symbolId: number, parentId: number): void {
+    this.db
+      .prepare("UPDATE symbols SET parent_symbol_id = ? WHERE id = ?")
+      .run(parentId, symbolId);
+  }
+
   getTopSymbols(limit: number = 20): SymbolRecord[] {
     return this.db
       .prepare(
@@ -351,33 +380,32 @@ export class SqliteStore {
       .all(limit) as SymbolRecord[];
   }
 
-  deleteSymbolsByFile(fileId: number): void {
-    // Delete FTS entries first
-    const symbolIds = this.db
-      .prepare("SELECT id FROM symbols WHERE file_id = ?")
-      .all(fileId) as Array<{ id: number }>;
-    const delFts = this.db.prepare(
-      "INSERT INTO symbols_fts (symbols_fts, rowid, name, signature, docstring) VALUES('delete', ?, '', '', '')",
-    );
-    for (const { id } of symbolIds) {
-      // We need the actual values for FTS delete
-      const sym = this.db
-        .prepare("SELECT name, signature, docstring FROM symbols WHERE id = ?")
-        .get(id) as { name: string; signature: string | null; docstring: string | null } | undefined;
-      if (sym) {
-        this.db
-          .prepare(
-            "INSERT INTO symbols_fts (symbols_fts, rowid, name, signature, docstring) VALUES('delete', ?, ?, ?, ?)",
-          )
-          .run(id, sym.name, sym.signature ?? "", sym.docstring ?? "");
-      }
+  deleteSymbolsByFile(fileId: number, rebuildFts: boolean = true): void {
+    if (rebuildFts) {
+      this.db.transaction(() => {
+        this.db.prepare("DELETE FROM symbols WHERE file_id = ?").run(fileId);
+        this.rebuildSymbolsFts();
+      })();
+    } else {
+      this.db.prepare("DELETE FROM symbols WHERE file_id = ?").run(fileId);
     }
-    this.db.prepare("DELETE FROM symbols WHERE file_id = ?").run(fileId);
+  }
+
+  rebuildSymbolsFts(): void {
+    this.db.exec("DROP TABLE IF EXISTS symbols_fts");
+    this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS symbols_fts USING fts5(
+      name,
+      signature,
+      docstring,
+      tokenize='unicode61'
+    )`);
+    this.db.exec(`INSERT INTO symbols_fts (rowid, name, signature, docstring)
+      SELECT id, name, COALESCE(signature, ''), COALESCE(docstring, '') FROM symbols`);
   }
 
   // === Chunks ===
 
-  insertChunk(chunk: ChunkRecord): number {
+  insertChunk(chunk: ChunkRecord, filePath?: string): number {
     const stmt = this.db.prepare(`
       INSERT INTO chunks (file_id, chunk_index, content, content_hash, start_line, end_line,
                           symbol_ids, token_count, embedding_model, embedded_at, lance_row_id)
@@ -387,8 +415,8 @@ export class SqliteStore {
     const result = stmt.run(chunk);
     const chunkId = Number(result.lastInsertRowid);
 
-    // Update FTS
-    const file = this.getFileById(chunk.file_id);
+    // Update FTS - use provided filePath to avoid extra query per chunk
+    const path = filePath ?? this.getFileById(chunk.file_id)?.path ?? "";
     this.db
       .prepare(
         "INSERT INTO chunks_fts (rowid, content, file_path, symbol_names) VALUES (?, ?, ?, ?)",
@@ -396,18 +424,18 @@ export class SqliteStore {
       .run(
         chunkId,
         chunk.content,
-        file?.path ?? "",
+        path,
         chunk.symbol_ids ?? "",
       );
 
     return chunkId;
   }
 
-  insertChunks(chunks: ChunkRecord[]): number[] {
+  insertChunks(chunks: ChunkRecord[], filePath?: string): number[] {
     const ids: number[] = [];
     const tx = this.db.transaction((chs: ChunkRecord[]) => {
       for (const c of chs) {
-        ids.push(this.insertChunk(c));
+        ids.push(this.insertChunk(c, filePath));
       }
     });
     tx(chunks);
@@ -439,20 +467,28 @@ export class SqliteStore {
     return new Set(rows.map((r) => r.content_hash));
   }
 
-  deleteChunksByFile(fileId: number): void {
-    // Delete FTS entries first
-    const chunks = this.db
-      .prepare("SELECT id, content FROM chunks WHERE file_id = ?")
-      .all(fileId) as Array<{ id: number; content: string }>;
-    const file = this.getFileById(fileId);
-    for (const chunk of chunks) {
-      this.db
-        .prepare(
-          "INSERT INTO chunks_fts (chunks_fts, rowid, content, file_path, symbol_names) VALUES('delete', ?, ?, ?, ?)",
-        )
-        .run(chunk.id, chunk.content, file?.path ?? "", "");
+  deleteChunksByFile(fileId: number, rebuildFts: boolean = true): void {
+    if (rebuildFts) {
+      this.db.transaction(() => {
+        this.db.prepare("DELETE FROM chunks WHERE file_id = ?").run(fileId);
+        this.rebuildChunksFts();
+      })();
+    } else {
+      this.db.prepare("DELETE FROM chunks WHERE file_id = ?").run(fileId);
     }
-    this.db.prepare("DELETE FROM chunks WHERE file_id = ?").run(fileId);
+  }
+
+  rebuildChunksFts(): void {
+    this.db.exec("DROP TABLE IF EXISTS chunks_fts");
+    this.db.exec(`CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+      content,
+      file_path,
+      symbol_names,
+      tokenize='porter unicode61'
+    )`);
+    this.db.exec(`INSERT INTO chunks_fts (rowid, content, file_path, symbol_names)
+      SELECT c.id, c.content, COALESCE(f.path, ''), COALESCE(c.symbol_ids, '')
+      FROM chunks c LEFT JOIN files f ON c.file_id = f.id`);
   }
 
   // === Graph Edges ===
@@ -631,8 +667,8 @@ export class SqliteStore {
   // === Bulk operations ===
 
   clearAllData(): void {
-    this.db.exec("DELETE FROM chunks_fts");
-    this.db.exec("DELETE FROM symbols_fts");
+    this.db.exec("DROP TABLE IF EXISTS chunks_fts");
+    this.db.exec("DROP TABLE IF EXISTS symbols_fts");
     this.db.exec("DELETE FROM graph_edges");
     this.db.exec("DELETE FROM file_dependencies");
     this.db.exec("DELETE FROM summaries");
@@ -640,6 +676,8 @@ export class SqliteStore {
     this.db.exec("DELETE FROM symbols");
     this.db.exec("DELETE FROM files");
     this.db.exec("DELETE FROM index_state");
+    // Recreate FTS tables
+    this.db.exec(FTS_SQL);
   }
 
   updateSymbolImportance(symbolId: number, score: number): void {

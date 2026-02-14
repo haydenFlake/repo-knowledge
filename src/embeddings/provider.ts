@@ -3,7 +3,7 @@ export interface EmbeddingProvider {
   readonly dimensions: number;
 
   initialize(): Promise<void>;
-  embed(texts: string[]): Promise<Float32Array[]>;
-  embedQuery(text: string): Promise<Float32Array>;
+  embed(texts: string[]): Promise<number[][]>;
+  embedQuery(text: string): Promise<number[]>;
   dispose(): Promise<void>;
 }

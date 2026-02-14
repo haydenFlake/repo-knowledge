@@ -2,6 +2,14 @@ import type { SearchResult } from "../search/hybrid.js";
 import type { SqliteStore, SymbolRecord } from "../storage/sqlite.js";
 import { estimateTokens } from "../utils/token-counter.js";
 
+export function escapeXmlAttr(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function escapeXmlContent(s: string): string {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
 /**
  * Format search results as XML-tagged output optimized for LLM consumption.
  */
@@ -41,12 +49,12 @@ export function formatSearchResults(
 
 function formatResultBlock(r: SearchResult): string {
   const scoreStr = r.score.toFixed(2);
-  return `<result file="${r.filePath}" lines="${r.startLine}-${r.endLine}" language="${r.language}" score="${scoreStr}" match="${r.matchType}">\n${r.content}\n</result>\n`;
+  return `<result file="${escapeXmlAttr(r.filePath)}" lines="${r.startLine}-${r.endLine}" language="${escapeXmlAttr(r.language)}" score="${scoreStr}" match="${r.matchType}">\n${escapeXmlContent(r.content)}\n</result>\n`;
 }
 
 function formatResultSignature(r: SearchResult): string {
   const firstLine = r.content.split("\n").slice(0, 3).join("\n");
-  return `<result file="${r.filePath}" lines="${r.startLine}-${r.endLine}" language="${r.language}" score="${r.score.toFixed(2)}" match="${r.matchType}" truncated="true">\n${firstLine}\n</result>\n`;
+  return `<result file="${escapeXmlAttr(r.filePath)}" lines="${r.startLine}-${r.endLine}" language="${escapeXmlAttr(r.language)}" score="${r.score.toFixed(2)}" match="${r.matchType}" truncated="true">\n${escapeXmlContent(firstLine)}\n</result>\n`;
 }
 
 /**
@@ -59,10 +67,10 @@ export function formatFileSummary(
   symbols: SymbolRecord[],
   purpose: string | null,
 ): string {
-  let output = `<file_summary path="${filePath}" language="${language ?? "unknown"}" lines="${lineCount ?? 0}">\n`;
+  let output = `<file_summary path="${escapeXmlAttr(filePath)}" language="${escapeXmlAttr(language ?? "unknown")}" lines="${lineCount ?? 0}">\n`;
 
   if (purpose) {
-    output += `  <purpose>${purpose}</purpose>\n`;
+    output += `  <purpose>${escapeXmlContent(purpose)}</purpose>\n`;
   }
 
   const exported = symbols.filter((s) => s.exported);
@@ -70,7 +78,7 @@ export function formatFileSummary(
     output += "  <exports>\n";
     for (const s of exported) {
       const sig = s.signature ?? s.name;
-      output += `    <symbol kind="${s.kind}" name="${s.name}" lines="${s.start_line}-${s.end_line}" importance="${s.importance_score.toFixed(2)}">${sig}</symbol>\n`;
+      output += `    <symbol kind="${s.kind}" name="${escapeXmlAttr(s.name)}" lines="${s.start_line}-${s.end_line}" importance="${s.importance_score.toFixed(2)}">${escapeXmlContent(sig)}</symbol>\n`;
     }
     output += "  </exports>\n";
   }
@@ -96,14 +104,22 @@ export function formatRepoOverview(
     .map(([l, c]) => `${l}(${c})`)
     .join(", ");
 
-  let output = `<repo_overview files="${stats.totalFiles}" symbols="${stats.totalSymbols}" languages="${langList}">\n`;
+  let output = `<repo_overview files="${stats.totalFiles}" symbols="${stats.totalSymbols}" languages="${escapeXmlAttr(langList)}">\n`;
   output += "  <key_symbols>\n";
 
   let tokensUsed = estimateTokens(output);
 
+  // Batch-load files to avoid N+1
+  const uniqueFileIds = [...new Set(topSymbols.map((s) => s.file_id))];
+  const fileCache = new Map<number, string>();
+  for (const fid of uniqueFileIds) {
+    const f = sqlite.getFileById(fid);
+    if (f) fileCache.set(fid, f.path);
+  }
+
   for (const s of topSymbols) {
-    const file = sqlite.getFileById(s.file_id);
-    const line = `    ${s.signature ?? s.name}  [${file?.path ?? "?"}:${s.start_line}]\n`;
+    const sig = escapeXmlContent(s.signature ?? s.name);
+    const line = `    ${sig}  [${fileCache.get(s.file_id) ?? "?"}:${s.start_line}]\n`;
     const lineTokens = estimateTokens(line);
 
     if (tokensUsed + lineTokens > tokenBudget - 50) break;
