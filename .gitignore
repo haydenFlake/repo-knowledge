@@ -1,0 +1,7 @@
+node_modules/
+dist/
+*.tsbuildinfo
+.repo-knowledge/
+grammars/*.wasm
+.DS_Store
+*.log
